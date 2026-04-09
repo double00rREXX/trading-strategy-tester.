@@ -4,129 +4,115 @@ import pandas as pd
 import numpy as np
 import scipy.stats as stats
 import plotly.graph_objects as go
-from datetime import time
 
-# --- Page Config ---
-st.set_page_config(page_title="QuantTest Pro V2", layout="wide")
-st.title("📊 Professional Strategy Tester: 20-Year & Session Analysis")
+st.set_page_config(page_title="QuantPro: 20-Year Session Tester", layout="wide")
 
-# --- Sidebar: Strategy & Sessions ---
-st.sidebar.header("Global Settings")
-asset = st.sidebar.selectbox("Select Asset", ["SPY", "ES=F", "NQ=F"])
-session_focus = st.sidebar.radio("Trading Session", ["NY Session (09:30-16:00)", "Asia Session (19:00-03:00)", "Full 24h Market"])
-lookback = st.sidebar.selectbox("Lookback", ["20y", "10y", "5y", "2y"])
+# --- Institutional UI ---
+st.title("📈 Realistic Session Backtester (20-Year Analysis)")
+st.markdown("""
+*This model reconstructs sessions by analyzing the **Opening Gap** (Asia/Europe) vs. **Intraday Range** (NY).*
+""")
 
-st.sidebar.header("Strategy Library")
-strategy_name = st.sidebar.selectbox("Select Strategy", [
-    "Opening Range Breakout (ORB)",
-    "Asia Range Fade",
-    "Dual Moving Average Trend",
-    "Mean Reversion (Bollinger/RSI)",
-    "MACD Momentum Divergence",
-    "Volatility Gap Close"
+# --- Sidebar ---
+st.sidebar.header("Execution Settings")
+asset = st.sidebar.selectbox("Select Asset", ["ES=F", "NQ=F", "SPY"])
+lookback = st.sidebar.selectbox("History", ["20y", "10y", "5y"])
+session_to_trade = st.sidebar.radio("Session to Trade", ["NY Session (Open-to-Close)", "ASIA/Overnight (Close-to-Open)"])
+
+st.sidebar.header("Strategy Parameters")
+strat_type = st.sidebar.selectbox("Strategy Logic", [
+    "Momentum (Follow previous session direction)",
+    "Mean Reversion (Fade previous session move)",
+    "Volatility Breakout (Standard Deviation)"
 ])
+ci_level = st.sidebar.slider("CI Accuracy (Student's T)", 0.90, 0.99, 0.95)
 
-confidence_level = st.sidebar.slider("Confidence Interval Accuracy", 0.90, 0.99, 0.95)
-
-# --- Data Engine (Handling Intraday vs Daily) ---
 @st.cache_data
-def load_market_data(ticker, period):
-    # Use 1h for short periods, 1d for 20y
-    interval = "1h" if period in ["1y", "2y"] else "1d"
-    df = yf.download(ticker, period=period, interval=interval)
-    return df
+def load_data(ticker, period):
+    data = yf.download(ticker, period=period, interval="1d")
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    return data
 
 try:
-    data = load_market_data(asset, lookback)
+    df = load_data(asset, lookback)
     
-    # --- Session Filtering Logic ---
-    def filter_sessions(df, session):
-        if '1d' in str(df.index.freq): # If daily data, session filtering is limited
-            return df 
-        # If hourly/intraday
-        df = df.copy()
-        if session == "NY Session (09:30-16:00)":
-            return df.between_time('09:30', '16:00')
-        elif session == "Asia Session (19:00-03:00)":
-            return df.between_time('19:00', '03:00')
-        return df
-
-    df = filter_sessions(data, session_focus)
-
-    # --- Strategy Models (Vectorized Math) ---
-    def apply_math_model(df, strat):
-        df = df.copy()
-        df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
-        
-        if strat == "Opening Range Breakout (ORB)":
-            df['Signal'] = np.where(df['High'] > df['High'].shift(1), 1, 0)
+    # --- The "Realistic" Session Reconstruction ---
+    # Log returns for mathematical accuracy
+    df['NY_Return'] = np.log(df['Close'] / df['Open'])
+    df['ASIA_Return'] = np.log(df['Open'] / df['Close'].shift(1))
+    
+    # Define "Signal" based on the PREVIOUS session's behavior
+    if strat_type == "Momentum (Follow previous session direction)":
+        # If Asia was UP, buy NY session
+        if session_to_trade == "NY Session (Open-to-Close)":
+            df['Signal'] = np.where(df['ASIA_Return'] > 0, 1, -1)
+        else: # If NY was UP yesterday, buy Asia session today
+            df['Signal'] = np.where(df['NY_Return'].shift(1) > 0, 1, -1)
             
-        elif strat == "Dual Moving Average Trend":
-            df['Fast'] = df['Close'].rolling(50).mean()
-            df['Slow'] = df['Close'].rolling(200).mean()
-            df['Signal'] = np.where(df['Fast'] > df['Slow'], 1, 0)
-            
-        elif strat == "Mean Reversion (Bollinger/RSI)":
-            df['MA'] = df['Close'].rolling(20).mean()
-            df['Std'] = df['Close'].rolling(20).std()
-            df['Upper'] = df['MA'] + (2 * df['Std'])
-            df['Lower'] = df['MA'] - (2 * df['Std'])
-            df['Signal'] = np.where(df['Close'] < df['Lower'], 1, np.where(df['Close'] > df['Upper'], 0, np.nan))
-            df['Signal'] = df['Signal'].ffill().fillna(0)
+    elif strat_type == "Mean Reversion (Fade previous session move)":
+        # If Asia was UP, short NY session
+        if session_to_trade == "NY Session (Open-to-Close)":
+            df['Signal'] = np.where(df['ASIA_Return'] > 0, -1, 1)
+        else: # If NY was UP yesterday, short Asia session
+            df['Signal'] = np.where(df['NY_Return'].shift(1) > 0, -1, 1)
 
-        elif strat == "Volatility Gap Close":
-            df['Gap'] = (df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)
-            df['Signal'] = np.where(df['Gap'] < -0.005, 1, 0) # Buy gaps down > 0.5%
-            
-        df['Strat_Ret'] = df['Log_Ret'] * df['Signal'].shift(1)
-        return df.dropna()
+    elif strat_type == "Volatility Breakout (Standard Deviation)":
+        std_window = 20
+        df['Vol'] = df['NY_Return'].rolling(std_window).std()
+        df['Signal'] = np.where(df['NY_Return'].abs() > df['Vol'], 1, 0)
 
-    processed_df = apply_math_model(df, strategy_name)
+    # --- Calculation of Strategy Returns ---
+    if session_to_trade == "NY Session (Open-to-Close)":
+        df['Strategy_Returns'] = df['NY_Return'] * df['Signal']
+        benchmark = df['NY_Return']
+    else:
+        df['Strategy_Returns'] = df['ASIA_Return'] * df['Signal']
+        benchmark = df['ASIA_Return']
 
-    # --- Advanced Statistics Engine ---
-    def get_stats(returns, ci_val):
-        # Student's T-Distribution for High Accuracy CI
-        mu = returns.mean()
-        sigma = returns.std()
-        dof = len(returns) - 1
-        # Confidence Interval (Standard Error of the Mean)
-        ci = stats.t.interval(ci_val, dof, loc=mu, scale=stats.sem(returns))
-        
-        # Risk Metrics
-        sharpe = (mu / sigma) * np.sqrt(252) if sigma != 0 else 0
-        max_dd = (np.exp(returns.cumsum()).cummax() - np.exp(returns.cumsum())).max()
-        
-        return {
-            "Annualized Return": f"{np.exp(returns.mean() * 252) - 1:.2%}",
-            "Sharpe Ratio": f"{sharpe:.2f}",
-            "Max Drawdown": f"{max_dd:.2%}",
-            "CI Lower Bound": f"{np.exp(ci[0] * 252) - 1:.2%}",
-            "CI Upper Bound": f"{np.exp(ci[1] * 252) - 1:.2%}"
-        }
+    df = df.dropna()
 
-    stats_results = get_stats(processed_df['Strat_Ret'], confidence_level)
+    # --- High Accuracy Math: Student's T-Distribution ---
+    # We use T-Distribution because financial returns have 'Fat Tails'
+    mu = df['Strategy_Returns'].mean()
+    se = stats.sem(df['Strategy_Returns']) # Standard Error
+    dof = len(df) - 1
+    
+    # CI for daily expected return
+    ci = stats.t.interval(ci_level, dof, loc=mu, scale=se)
+    
+    # Annualizing results
+    ann_return = np.exp(df['Strategy_Returns'].mean() * 252) - 1
+    ann_vol = df['Strategy_Returns'].std() * np.sqrt(252)
+    sharpe = (df['Strategy_Returns'].mean() / df['Strategy_Returns'].std()) * np.sqrt(252)
 
-    # --- UI Display ---
-    st.header(f"Results for {asset} ({strategy_name})")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Ann. Return", stats_results["Annualized Return"])
-    col2.metric("Sharpe", stats_results["Sharpe Ratio"])
-    col3.metric("Max Drawdown", stats_results["Max Drawdown"])
-    col4.metric("CI Upper (Math Accuracy)", stats_results["CI Upper Bound"])
+    # --- Display Metrics ---
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Annualized Return", f"{ann_return:.2%}")
+    c2.metric("Sharpe Ratio", f"{sharpe:.2f}")
+    c3.metric("95% CI Lower", f"{np.exp(ci[0]*252)-1:.2%}")
+    c4.metric("95% CI Upper", f"{np.exp(ci[1]*252)-1:.2%}")
 
-    # --- Plotting ---
+    # --- Equity Curve Plotting ---
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=processed_df.index, y=processed_df['Strat_Ret'].cumsum().apply(np.exp), 
-                             name="Strategy Equity", line=dict(color='#00ffcc', width=2)))
-    fig.update_layout(template="plotly_dark", title="Equity Growth of $1.00", height=500)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Strategy_Returns'].cumsum().apply(np.exp), 
+                             name="Strategy Equity", line=dict(color='cyan')))
+    fig.add_trace(go.Scatter(x=df.index, y=benchmark.cumsum().apply(np.exp), 
+                             name="Session Benchmark", line=dict(color='gray', dash='dash')))
+    
+    fig.update_layout(template="plotly_dark", title=f"20-Year {session_to_trade} Performance", height=600)
     st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("Detailed Math & Model Assumptions"):
-        st.write("""
-        - **Modeling:** We use Logarithmic Returns for time-additivity.
-        - **Statistical Rigor:** Confidence Intervals use the Student's T-Distribution to account for the 'Fat Tails' (excess kurtosis) found in SPY and NQ Futures.
-        - **Session Constraint:** For 20-year lookbacks, data is Daily. Session-specific hourly filters are only applied if lookback is ≤ 2 years.
+    # Statistics Deep Dive
+    with st.expander("Show Scientific Statistical Model"):
+        st.write(f"""
+        **Model Details:**
+        - **Degrees of Freedom:** {dof}
+        - **Daily Mean (Log):** {mu:.6f}
+        - **Standard Error:** {se:.6f}
+        - **Confidence Interval Method:** Student's T (More accurate for NQ/ES fat-tails than Gaussian models).
+        - **Session Split:** NY defined as Open-to-Close. ASIA/London defined as Prev Close-to-Open.
         """)
 
 except Exception as e:
-    st.error(f"Waiting for valid data... (Error: {e})")
+    st.error(f"Error: {e}")
